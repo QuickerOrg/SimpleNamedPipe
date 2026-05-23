@@ -21,14 +21,19 @@ internal class ByteBasedEncoder : IMessageEncoder
 #endif
 	private static readonly UTF8Encoding Utf8Encoding = new(false);
 	private readonly bool _isLittleEndian;
+	private readonly int _maxMessageBytes;
 
 	/// <summary>
 	/// 初始化ByteBasedEncoder
 	/// </summary>
 	/// <param name="isLittleEndian">是否使用小端字节序，true为小端，false为大端</param>
-	public ByteBasedEncoder(bool isLittleEndian = true)
+	/// <param name="maxMessageBytes">允许接收的最大消息字节数。</param>
+	public ByteBasedEncoder(bool isLittleEndian = true, int maxMessageBytes = 1024 * 1024)
 	{
 		_isLittleEndian = isLittleEndian;
+		_maxMessageBytes = maxMessageBytes > 0
+			? maxMessageBytes
+			: throw new ArgumentOutOfRangeException(nameof(maxMessageBytes));
 	}
 
 	public async Task WriteMessageAsync(PipeStream stream, string message, CancellationToken cancellationToken)
@@ -86,34 +91,24 @@ internal class ByteBasedEncoder : IMessageEncoder
 		byte[] lengthBuffer = new byte[sizeof(int)];
 
 		//var read = await stream.ReadAsync(lengthBuffer, cancellationToken);
-		var read = await stream.ReadAsync(lengthBuffer,0,sizeof(int), cancellationToken);
-
-
-		if (read < sizeof(int))
-		{
-			throw new IOException("Connection closed while reading message length");
-		}
+		await ReadExactAsync(stream, lengthBuffer, sizeof(int), cancellationToken);
 
 #if NETFRAMEWORK
 		var messageLength = _isLittleEndian ? 
 			ReadInt32LittleEndian(lengthBuffer) : 
 			ReadInt32BigEndian(lengthBuffer);
-		if (messageLength <= 0) // 1MB 限制
+		if (messageLength <= 0)
 		{
 			throw new InvalidDataException($"Invalid message length: {messageLength}");
 		}
-		else if (messageLength > 1024 * 1024)
+		else if (messageLength > _maxMessageBytes)
 		{
 			throw new InvalidDataException($"Message length too long: {messageLength}");
 		}
 
 		// 从共享池租用缓冲区
 		var buffer = new byte[messageLength];
-		read = await stream.ReadAsync(buffer, 0, messageLength, cancellationToken);
-		if (read < messageLength)
-		{
-			throw new IOException("Connection closed while reading message body");
-		}
+		await ReadExactAsync(stream, buffer, messageLength, cancellationToken);
 
 		// 直接解码指定长度
 		return Utf8Encoding.GetString(buffer, 0, messageLength);
@@ -122,11 +117,11 @@ internal class ByteBasedEncoder : IMessageEncoder
 		var messageLength = _isLittleEndian ? 
 			BinaryPrimitives.ReadInt32LittleEndian(lengthBuffer) :
 			BinaryPrimitives.ReadInt32BigEndian(lengthBuffer);
-		if (messageLength <= 0) // 1MB 限制
+		if (messageLength <= 0)
 		{
 			throw new InvalidDataException($"Invalid message length: {messageLength}");
 		}
-		else if (messageLength > 1024 * 1024)
+		else if (messageLength > _maxMessageBytes)
 		{
 			throw new InvalidDataException($"Message length too long: {messageLength}");
 		}
@@ -135,11 +130,7 @@ internal class ByteBasedEncoder : IMessageEncoder
 		var buffer = _arrayPool.Rent(messageLength);
 		try
 		{
-			read = await stream.ReadAsync(buffer, 0, messageLength, cancellationToken);
-			if (read < messageLength)
-			{
-				throw new IOException("Connection closed while reading message body");
-			}
+			await ReadExactAsync(stream, buffer, messageLength, cancellationToken);
 
 			// 直接解码指定长度
 			return Utf8Encoding.GetString(buffer, 0, messageLength);
@@ -150,6 +141,21 @@ internal class ByteBasedEncoder : IMessageEncoder
 			_arrayPool.Return(buffer);
 		}
 #endif
+	}
+
+	private static async Task ReadExactAsync(PipeStream stream, byte[] buffer, int count, CancellationToken cancellationToken)
+	{
+		var offset = 0;
+		while (offset < count)
+		{
+			var read = await stream.ReadAsync(buffer, offset, count - offset, cancellationToken);
+			if (read == 0)
+			{
+				throw new IOException("Connection closed while reading message");
+			}
+
+			offset += read;
+		}
 	}
 
 #if NETFRAMEWORK

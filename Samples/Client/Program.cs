@@ -21,8 +21,10 @@ namespace PipeClientTest
 
 		static async Task TestClient(int index)
 		{
-			var client = new PipeClient("MyPipeName",
-				clientName: $"Client_{index}", useMessageBasedEncoder:false);
+			var client = new PipeClient(
+				"MyPipeName",
+				clientName: $"Client_{index}",
+				transmissionMode: MessageTransmissionMode.ByteBasedBigEndian);
 
 			// 注册事件处理器
 			client.Connected += (sender, e) =>

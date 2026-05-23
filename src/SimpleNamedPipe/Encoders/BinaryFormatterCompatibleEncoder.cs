@@ -35,6 +35,7 @@ internal class BinaryFormatterCompatibleEncoder : IMessageEncoder
 #endif
     private static readonly UTF8Encoding Utf8Encoding = new(false);
     private readonly bool _isLittleEndian;
+    private readonly int _maxMessageBytes;
 
     // BinaryFormatter 序列化头
     private static readonly byte[] BINARY_FORMATTER_HEADER = {
@@ -49,9 +50,13 @@ internal class BinaryFormatterCompatibleEncoder : IMessageEncoder
     /// 初始化BinaryFormatterCompatibleEncoder
     /// </summary>
     /// <param name="isLittleEndian">是否使用小端字节序，true为小端，false为大端</param>
-    public BinaryFormatterCompatibleEncoder(bool isLittleEndian = true)
+    /// <param name="maxMessageBytes">允许接收的最大消息字节数。</param>
+    public BinaryFormatterCompatibleEncoder(bool isLittleEndian = true, int maxMessageBytes = 10 * 1024 * 1024)
     {
         _isLittleEndian = isLittleEndian;
+        _maxMessageBytes = maxMessageBytes > 0
+            ? maxMessageBytes
+            : throw new ArgumentOutOfRangeException(nameof(maxMessageBytes));
     }
 
     public async Task WriteMessageAsync(PipeStream stream, string message, CancellationToken cancellationToken)
@@ -126,12 +131,7 @@ internal class BinaryFormatterCompatibleEncoder : IMessageEncoder
     {
         // Read the length of the entire payload
         byte[] lengthBuffer = new byte[sizeof(int)];
-        int read = await stream.ReadAsync(lengthBuffer, 0, sizeof(int), cancellationToken);
-
-        if (read < sizeof(int))
-        {
-            throw new IOException("Connection closed while reading message length");
-        }
+        await ReadExactAsync(stream, lengthBuffer, sizeof(int), cancellationToken);
 
 #if NETFRAMEWORK
         var dataLength = _isLittleEndian ? 
@@ -143,28 +143,20 @@ internal class BinaryFormatterCompatibleEncoder : IMessageEncoder
             BinaryPrimitives.ReadInt32BigEndian(lengthBuffer);
 #endif
 
-        if (dataLength <= 0 || dataLength > 10 * 1024 * 1024) // 10MB limit
+        if (dataLength <= 0 || dataLength > _maxMessageBytes)
         {
             throw new InvalidDataException($"Invalid data length: {dataLength}");
         }
 
 #if NETFRAMEWORK
         var dataBuffer = new byte[dataLength];
-        read = await stream.ReadAsync(dataBuffer, 0, dataLength, cancellationToken);
-        if (read < dataLength)
-        {
-            throw new IOException("Connection closed while reading message body");
-        }
+        await ReadExactAsync(stream, dataBuffer, dataLength, cancellationToken);
         return ParseBinaryFormatterString(dataBuffer);
 #else
         var dataBuffer = _arrayPool.Rent(dataLength);
         try
         {
-            read = await stream.ReadAsync(dataBuffer, 0, dataLength, cancellationToken);
-            if (read < dataLength)
-            {
-                throw new IOException("Connection closed while reading message body");
-            }
+            await ReadExactAsync(stream, dataBuffer, dataLength, cancellationToken);
             // Use AsSpan to avoid copying the rented buffer.
             return ParseBinaryFormatterString(dataBuffer.AsSpan(0, dataLength));
         }
@@ -173,6 +165,21 @@ internal class BinaryFormatterCompatibleEncoder : IMessageEncoder
             _arrayPool.Return(dataBuffer);
         }
 #endif
+    }
+
+    private static async Task ReadExactAsync(PipeStream stream, byte[] buffer, int count, CancellationToken cancellationToken)
+    {
+        var offset = 0;
+        while (offset < count)
+        {
+            var read = await stream.ReadAsync(buffer, offset, count - offset, cancellationToken);
+            if (read == 0)
+            {
+                throw new IOException("Connection closed while reading message");
+            }
+
+            offset += read;
+        }
     }
 
 #if NETFRAMEWORK

@@ -1,22 +1,27 @@
-﻿using System.IO.Pipes;
+using System;
+using System.Buffers;
+using System.IO;
+using System.IO.Pipes;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 
-using System.Buffers;
-
 namespace SimpleNamedPipe;
 
 /// <summary>
-/// 基于 PipeTransmissionMode.Message 的消息编码器（不进行什么编码，直接发送字符串）
+/// 基于 PipeTransmissionMode.Message 的消息编码器，直接发送 UTF-8 字符串。
 /// </summary>
 internal class MessageBasedEncoder : IMessageEncoder
 {
-	/// <summary>
-	/// 对应的管道传输模式
-	/// </summary>
-	// CA1416: This type is only available on 'windows' 7.0 and later. PipeTransmissionMode.Message is Windows-specific.
-	// Using this encoder will limit the pipe's cross-platform compatibility.
+	private readonly int _maxMessageBytes;
+
+	public MessageBasedEncoder(int maxMessageBytes = 1024 * 1024)
+	{
+		_maxMessageBytes = maxMessageBytes > 0
+			? maxMessageBytes
+			: throw new ArgumentOutOfRangeException(nameof(maxMessageBytes));
+	}
+
 #pragma warning disable CA1416
 	public PipeTransmissionMode TransmissionMode => PipeTransmissionMode.Message;
 #pragma warning restore CA1416
@@ -24,23 +29,31 @@ internal class MessageBasedEncoder : IMessageEncoder
 	public async Task WriteMessageAsync(PipeStream stream, string message, CancellationToken cancellationToken)
 	{
 		byte[] buffer = Encoding.UTF8.GetBytes(message);
-		await stream.WriteAsync(buffer, 0, buffer.Length, cancellationToken);
-		await stream.FlushAsync(cancellationToken);
+		await stream.WriteAsync(buffer, 0, buffer.Length, cancellationToken).ConfigureAwait(false);
+		await stream.FlushAsync(cancellationToken).ConfigureAwait(false);
 	}
-
 
 	public async Task<string> ReadMessageAsync(PipeStream stream, CancellationToken cancellationToken)
 	{
-		byte[] buffer = ArrayPool<byte>.Shared.Rent(4096); // Rent buffer from pool
+		byte[] buffer = ArrayPool<byte>.Shared.Rent(4096);
 		var messageBuilder = new StringBuilder();
+		var totalBytesRead = 0;
 
 		try
 		{
 			do
 			{
-				int bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length, cancellationToken);
+				int bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length, cancellationToken).ConfigureAwait(false);
 				if (bytesRead == 0)
-					break; // 连接已关闭
+				{
+					break;
+				}
+
+				totalBytesRead += bytesRead;
+				if (totalBytesRead > _maxMessageBytes)
+				{
+					throw new InvalidDataException($"Message length too long: {totalBytesRead}");
+				}
 
 				messageBuilder.Append(Encoding.UTF8.GetString(buffer, 0, bytesRead));
 			}
@@ -48,11 +61,9 @@ internal class MessageBasedEncoder : IMessageEncoder
 		}
 		finally
 		{
-			ArrayPool<byte>.Shared.Return(buffer); // Return buffer to pool
+			ArrayPool<byte>.Shared.Return(buffer);
 		}
-		
-		string message = messageBuilder.ToString();
 
-		return message;
+		return messageBuilder.ToString();
 	}
 }

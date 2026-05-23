@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.IO;
 using System.IO.Pipes;
 using System.Linq;
+using System.Security.AccessControl;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -18,45 +19,53 @@ public class PipeServer : IDisposable, IAsyncDisposable
 
 	private readonly string _pipeName;
 	private readonly bool _enableClientName;
+	private readonly PipeSecurity? _pipeSecurity;
 	private readonly ConcurrentDictionary<int, PipeClientInfo> _activeClients;
 	private CancellationTokenSource? _cancellationTokenSource;
 	private Task? _listenerTask;
+	private NamedPipeServerStream? _pendingPipeServerStream;
 	private int _clientCount;
 	private bool _isDisposed;
 
-	public bool IsRunning => _listenerTask != null 
+	public bool IsRunning => _listenerTask != null
+	                         && !_listenerTask.IsCompleted
 	                         && _cancellationTokenSource?.Token.IsCancellationRequested != true;
 
 	private readonly IMessageEncoder _encoder;
 
 	public PipeServer(string pipeName, 
         bool enableClientName = false, 
-        MessageTransmissionMode transmissionMode = MessageTransmissionMode.ByteBasedBigEndian)
+        MessageTransmissionMode transmissionMode = MessageTransmissionMode.ByteBasedBigEndian,
+        PipeSecurity? pipeSecurity = null,
+        int maxMessageBytes = 1024 * 1024)
 	{
 		_pipeName = pipeName ?? throw new ArgumentNullException(nameof(pipeName));
 		_enableClientName = enableClientName;
+		_pipeSecurity = pipeSecurity;
 		_activeClients = new ConcurrentDictionary<int, PipeClientInfo>();
 		_clientCount = 0;
 
 		// 使用工厂方法创建编码器
-		_encoder = MessageEncoderFactory.CreateEncoder(transmissionMode);
+		_encoder = MessageEncoderFactory.CreateEncoder(transmissionMode, maxMessageBytes);
 	}
 
-	public async Task StartAsync()
+	public Task StartAsync()
 	{
 		if (IsRunning)
 			throw new InvalidOperationException("Server is already running");
 
 		_cancellationTokenSource = new CancellationTokenSource();
 		_listenerTask = ListenForClientsAsync(_cancellationTokenSource.Token);
+		return Task.CompletedTask;
 	}
 
 	public async Task StopAsync()
 	{
-		if (!IsRunning)
+		if (_listenerTask == null && _activeClients.IsEmpty)
 			return;
 
 		_cancellationTokenSource?.Cancel();
+		_pendingPipeServerStream?.Dispose();
 
 		try
 		{
@@ -67,6 +76,10 @@ public class PipeServer : IDisposable, IAsyncDisposable
 		{
 			// Expected exception when canceling the task
 		}
+		catch (Exception ex)
+		{
+			Debug.WriteLine($"Error stopping pipe server: {ex}");
+		}
 
 		// 关闭所有客户端连接
 		var clientIds = _activeClients.Keys.ToList(); // Create a copy of client IDs
@@ -75,14 +88,15 @@ public class PipeServer : IDisposable, IAsyncDisposable
 			DisconnectClient(clientId);
 		}
 
-		_activeClients.Clear(); // Now it's safe to clear
 		_listenerTask = null;
 	}
 
 	public async Task SendMessageAsync(int clientId, string message, CancellationToken cancellationToken = default)
 	{
-		if (string.IsNullOrEmpty(message))
+		if (message == null)
 			throw new ArgumentNullException(nameof(message));
+		if (message.Length == 0)
+			throw new ArgumentException("Message cannot be empty.", nameof(message));
 
 		if (!_activeClients.TryGetValue(clientId, out var clientInfo))
 			throw new ArgumentException($"Client {clientId} not found");
@@ -110,8 +124,6 @@ public class PipeServer : IDisposable, IAsyncDisposable
 
 	public async Task BroadcastMessageAsync(string message, CancellationToken cancellationToken = default)
 	{
-		var disconnectedClients = new ConcurrentBag<int>();
-
 		var sendTasks = _activeClients.Select(async client =>
 		{
 			try
@@ -121,16 +133,10 @@ public class PipeServer : IDisposable, IAsyncDisposable
 			catch (Exception ex)
 			{
 				Debug.WriteLine($"Error broadcasting to client {client.Key}: {ex}");
-				disconnectedClients.Add(client.Key);
 			}
 		});
 
 		await Task.WhenAll(sendTasks);
-
-		foreach (var clientId in disconnectedClients)
-		{
-			DisconnectClient(clientId);
-		}
 	}
 
 	private async Task ListenForClientsAsync(CancellationToken cancellationToken)
@@ -141,15 +147,11 @@ public class PipeServer : IDisposable, IAsyncDisposable
 
 			try
 			{
-				pipeServerStream = new NamedPipeServerStream(
-					_pipeName,
-					PipeDirection.InOut,
-					NamedPipeServerStream.MaxAllowedServerInstances,
-					_encoder.TransmissionMode,
-					PipeOptions.Asynchronous
-				);
+				pipeServerStream = CreatePipeServerStream();
+				_pendingPipeServerStream = pipeServerStream;
 
 				await pipeServerStream.WaitForConnectionAsync(cancellationToken).ConfigureAwait(false);
+				_pendingPipeServerStream = null;
 
 				int clientId = Interlocked.Increment(ref _clientCount);
 				var clientInfo = new PipeClientInfo(clientId, pipeServerStream);
@@ -177,6 +179,10 @@ public class PipeServer : IDisposable, IAsyncDisposable
 				pipeServerStream?.Dispose();
 				break;
 			}
+			catch (ObjectDisposedException) when (cancellationToken.IsCancellationRequested)
+			{
+				break;
+			}
 			catch (Exception ex)
 			{
 				pipeServerStream?.Dispose();
@@ -184,7 +190,53 @@ public class PipeServer : IDisposable, IAsyncDisposable
 				// 继续监听，不要因为单个客户端的错误而停止服务器
 				await Task.Delay(1000, cancellationToken); // 添加延迟避免过于频繁的重试
 			}
+			finally
+			{
+				if (ReferenceEquals(_pendingPipeServerStream, pipeServerStream))
+				{
+					_pendingPipeServerStream = null;
+				}
+			}
 		}
+	}
+
+	private NamedPipeServerStream CreatePipeServerStream()
+	{
+		if (_pipeSecurity == null)
+		{
+			return new NamedPipeServerStream(
+				_pipeName,
+				PipeDirection.InOut,
+				NamedPipeServerStream.MaxAllowedServerInstances,
+				_encoder.TransmissionMode,
+				PipeOptions.Asynchronous);
+		}
+
+#if NETFRAMEWORK
+		// 允许主程序显式传入 ACL，支持低权限进程连接提权后的主程序。
+		return new NamedPipeServerStream(
+			_pipeName,
+			PipeDirection.InOut,
+			NamedPipeServerStream.MaxAllowedServerInstances,
+			_encoder.TransmissionMode,
+			PipeOptions.Asynchronous,
+			0,
+			0,
+			_pipeSecurity);
+#elif NETSTANDARD
+		throw new PlatformNotSupportedException("PipeSecurity is not supported by the netstandard target. Use a framework-specific target such as net472 or net10.0-windows.");
+#else
+		// .NET Core/5+ 上带 ACL 的命名管道通过 AccessControl 扩展创建。
+		return NamedPipeServerStreamAcl.Create(
+			_pipeName,
+			PipeDirection.InOut,
+			NamedPipeServerStream.MaxAllowedServerInstances,
+			_encoder.TransmissionMode,
+			PipeOptions.Asynchronous,
+			0,
+			0,
+			_pipeSecurity);
+#endif
 	}
 
 	private async Task HandleClientCommunicationAsync(PipeClientInfo clientInfo, CancellationToken cancellationToken)
@@ -279,20 +331,8 @@ public class PipeServer : IDisposable, IAsyncDisposable
 			// Block on DisposeAsync() for the sync Dispose() pattern.
 			// This can be problematic in some contexts (e.g. UI thread).
 			// Consumers are encouraged to use DisposeAsync() where possible.
-			Task.Run(async () =>
-			{
-				try
-				{
-				await DisposeAsync();//.AsTask().GetAwaiter().GetResult();
-
-				}catch(Exception ex)
-				{
-					Debug.WriteLine(ex.Message);
-				}
-			});
+			DisposeAsync().AsTask().GetAwaiter().GetResult();
 		}
-
-		_isDisposed = true;
 	}
 
 	public async ValueTask DisposeAsync()
